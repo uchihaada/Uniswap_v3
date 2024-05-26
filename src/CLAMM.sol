@@ -6,6 +6,7 @@ import "./lib/Tick.sol";
 import "./lib/Position.sol";
 import "./interfaces/IERC20.sol";
 import "./lib/TickMath.sol";
+import "./lib/SqrtPriceMath.sol";
 
 contract CLAMM {
     using SafeCast for int256;
@@ -26,6 +27,7 @@ contract CLAMM {
     }
 
     Slot0 public slot0;
+    uint128 public liquidity;
     mapping(int24 => Tick.Info) public ticks;
     mapping(bytes32 => Position.Info) public positions;
     modifier lock() {
@@ -131,6 +133,37 @@ contract CLAMM {
             params.liquidityDelta,
             _slot0.tick
         );
+
+        if (params.liquidityDelta != 0) {
+            if (_slot0.tick < params.tickLower) {
+                amount0 = SqrtPriceMath.getAmount0Delta(
+                    TickMath.getSqrtRatioAtTick(params.tickLower),
+                    TickMath.getSqrtRatioAtTick(params.tickUpper),
+                    params.liquidityDelta
+                );
+            }
+        } else if (_slot0.tick < params.tickUpper) {
+            amount0 = SqrtPriceMath.getAmount0Delta(
+                _slot0.sqrtPriceX96,
+                TickMath.getSqrtRatioAtTick(params.tickUpper),
+                params.liquidityDelta
+            );
+            amount1 = SqrtPriceMath.getAmount1Delta(
+                TickMath.getSqrtRatioAtTick(params.tickLower),
+                TickMath.getSqrtRatioAtTick(params.tickUpper),
+                params.liquidityDelta
+            );
+            liquidity = params.liquidityDelta < 0
+                ? liquidity - uint128(-params.liquidityDelta)
+                : liquidity + uint128(params.liquidityDelta);
+        } else {
+            amount1 = SqrtPriceMath.getAmount1Delta(
+                TickMath.getSqrtRatioAtTick(params.tickLower),
+                _slot0.sqrtPriceX96,
+                params.liquidityDelta
+            );
+        }
+
         return (positions[bytes32(0)], 0, 0);
     }
 
@@ -162,5 +195,64 @@ contract CLAMM {
         require(tickLower < tickUpper, "TLU");
         require(tickLower >= TickMath.MIN_TICK, "TLM");
         require(tickUpper <= TickMath.MAX_TICK, "TUM");
+    }
+
+    function collect(
+        address recipient,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 amount0Requested,
+        uint128 amount1Requested
+    ) external lock returns (uint128 amount0, uint128 amount1) {
+        // we don't need to checkTicks here, because invalid positions will never have non-zero tokensOwed{0,1}
+        Position.Info storage position = positions.get(
+            msg.sender,
+            tickLower,
+            tickUpper
+        );
+
+        amount0 = amount0Requested > position.tokensOwed0
+            ? position.tokensOwed0
+            : amount0Requested;
+        amount1 = amount1Requested > position.tokensOwed1
+            ? position.tokensOwed1
+            : amount1Requested;
+
+        if (amount0 > 0) {
+            position.tokensOwed0 -= amount0;
+            IERC20(token0).transfer(recipient, amount0);
+        }
+        if (amount1 > 0) {
+            position.tokensOwed1 -= amount1;
+            IERC20(token1).transfer(recipient, amount1);
+        }
+    }
+
+    function burn(
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 amount
+    ) external lock returns (uint256 amount0, uint256 amount1) {
+        (
+            Position.Info storage position,
+            int256 amount0Int,
+            int256 amount1Int
+        ) = _modifyPosition(
+                ModifyPositionParams({
+                    owner: msg.sender,
+                    tickLower: tickLower,
+                    tickUpper: tickUpper,
+                    liquidityDelta: -int256(uint256(amount)).toInt128()
+                })
+            );
+        amount0 = uint256(-amount0Int);
+        amount1 = uint256(-amount1Int);
+
+        if (amount0 > 0 || amount1 > 0) {
+            (position.tokensOwed0, position.tokensOwed1) = (
+                position.tokensOwed0 + uint128(amount0),
+                position.tokensOwed1 + uint128(amount1)
+            );
+        }
     }
 }
